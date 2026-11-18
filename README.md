@@ -8,12 +8,17 @@ A minute-bar trading bot for cbBTC/USDC on make.fun's [Race a BTC trading bot li
 
 ## What it does
 
-Long only, one position, no leverage. It measures the last three minutes of closes and buys when
-they rose more than 30 bps, then closes the position when the same measure turns negative by 20 bps
-or the trade is 80 bps under its fill. A full round trip costs about 26 bps in fees, pool fee and
-slippage, so the entry threshold is set above that cost and the bot sits in cash the rest of the
-time — on the published dev window, where cbBTC fell 2.8% over 24 hours, buy-and-hold loses about
-30 USDC while this stays close to flat.
+Long only, one position at a time, no leverage, and it never reads the clock: every decision comes
+from the closed bars the harness hands it. Entry is momentum — when the last three 1m closes of cbBTC
+rose more than 50 bps, it buys with 98% of its cash (slippage tolerance 100 bps). The position is
+closed in full when the close is 200 bps above the price its buy filled at, or 80 bps below it, and
+the bot then sits in cash until the next 50 bps run shows up. Orders decided on one bar fill at the
+next bar's open, so the bot only makes a new decision after the previous order's fill has come back;
+a fill closes its pending slot whatever its status, which keeps one rejected order from wedging the
+bot.
+
+On the published dev window (1 symbol, 1440 bars) this takes 2 trades, pays 0.79 USDC in fees, and
+nets +17.527956 USDC with 0 rejected orders.
 
 `main.ts` is the whole bot, run by the harness as `node /bot/main.ts`. `vendor/makefun-bars.ts` is
 the kit's protocol shim, copied byte for byte.

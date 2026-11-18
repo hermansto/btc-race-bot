@@ -2,7 +2,7 @@
 //
 // Long only, one position at a time, no leverage, no clock:
 //   entry  - the last three 1m closes rose more than 50 bps -> buy with 98% of cash
-//   exit   - close is 200 bps above the entry price (take profit) or 80 bps below it (stop)
+//   exit   - close is 200 bps above the fill price (take profit) or 80 bps below it (stop)
 // Orders decided on bar k fill at bar k + 1's open, so a decision is only made once the previous
 // one has come back in `fills`; that is what pendingBuy / pendingSell guard.
 
@@ -12,8 +12,8 @@ import type { Batch, BarsState, OrderInput } from './vendor/makefun-bars.ts';
 const BPS = 10_000n;
 
 const ENTRY_GAIN_BPS = 50n; // "3 minutes up more than 50 bps"
-const TAKE_PROFIT_BPS = 200n; // sell at +200 bps from entry
-const STOP_LOSS_BPS = 80n; // sell at -80 bps from entry
+const TAKE_PROFIT_BPS = 200n; // sell at +200 bps from the fill price
+const STOP_LOSS_BPS = 80n; // sell at -80 bps from the fill price
 const LOOKBACK_BARS = 3; // 3 minutes on 1m bars
 const CASH_NUM = 98n; // notional = 98% of cash (the rest pays the fee)
 const CASH_DEN = 100n;
@@ -41,7 +41,7 @@ function costPrice(state: BarsState, symbol: string, qty: bigint, cost: bigint):
 async function main(): Promise<void> {
   const closes: bigint[] = [];
   let symbol: string | null = null;
-  let entryPrice: bigint | null = null; // set from the buy fill, cleared by the sell fill
+  let entryPrice: bigint | null = null; // set by a filled buy, cleared by a filled sell
   let pendingBuy = false; // a buy is on the wire, its fill arrives next batch
   let pendingSell = false; // a sell is on the wire, its fill arrives next batch
 
@@ -55,20 +55,27 @@ async function main(): Promise<void> {
       const sym = symbol;
       if (sym === null) return [];
 
-      // 1. Fold in the fills of the decision made on the previous bar.
+      // 1. Fold in the fills of the decision made on the previous bar. Every fill answers the
+      //    pending it belongs to and clears it whatever its status, so a rejected order can never
+      //    leave pendingBuy / pendingSell stuck true; entryPrice moves only on a filled one, since
+      //    a rejected buy never happened and a rejected sell still holds the position.
       for (const fill of batch.fills) {
         if (fill.symbol !== sym) continue;
+        const filled = fill.status === 'filled';
         if (fill.side === 'buy') {
           pendingBuy = false;
-          if (fill.status === 'filled') entryPrice = BigInt(fill.price);
+          if (filled) entryPrice = BigInt(fill.price);
         } else {
           pendingSell = false;
-          if (fill.status === 'filled') entryPrice = null;
+          if (filled) entryPrice = null;
         }
       }
 
-      // 2. Keep the close history (one close per bar the symbol traded).
+      // 2. No bar for this symbol and no close yet: nothing to trade on, don't touch state.
       const bar = batch.bars.find((b) => b.symbol === sym);
+      if (bar === undefined && state.close(sym) === null) return [];
+
+      // 3. Keep the close history (one close per bar the symbol traded).
       if (bar !== undefined) {
         closes.push(BigInt(bar.c));
         if (closes.length > MAX_HISTORY) closes.splice(0, closes.length - MAX_HISTORY);
@@ -77,7 +84,7 @@ async function main(): Promise<void> {
       const price = state.close(sym);
       if (price === null || state.warmingUp) return []; // nothing tradeable yet
 
-      // 3. Holding: check take profit / stop loss against the entry price.
+      // 4. Holding: check take profit / stop loss against the entry price.
       const position = state.positions.get(sym);
       if (position !== undefined && position.qty > 0n) {
         if (entryPrice === null) entryPrice = costPrice(state, sym, position.qty, position.cost);
@@ -92,7 +99,7 @@ async function main(): Promise<void> {
         return [];
       }
 
-      // 4. Flat: momentum entry, only when the previous decision has settled.
+      // 5. Flat: momentum entry, only when the previous decision has settled.
       if (pendingBuy) return [];
       if (closes.length <= LOOKBACK_BARS) return [];
       const now = closes[closes.length - 1]!;
