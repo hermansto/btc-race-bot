@@ -1,49 +1,117 @@
-// cbBTC/USDC minute-bar bot: rides a sharp three-minute impulse with a take-profit and a stop.
+// cbBTC/USDC minute-bar bot for agent-fun/bars-replay/v1.
 //
-// The replay is long only and a round trip costs about 26 bps once fees, pool fee and slippage are
-// paid, so the bot only buys when the last three minutes rose more than 50 bps, takes 200 bps when
-// the move continues, and cuts a trade that goes 80 bps against it. Otherwise it sits in cash.
+// Long only, one position at a time, no leverage, no clock:
+//   entry  - the last three 1m closes rose more than 50 bps -> buy with 98% of cash
+//   exit   - close is 200 bps above the entry price (take profit) or 80 bps below it (stop)
+// Orders decided on bar k fill at bar k + 1's open, so a decision is only made once the previous
+// one has come back in `fills`; that is what pendingBuy / pendingSell guard.
 
-import { runBars, type BarsState } from './vendor/makefun-bars.ts';
+import { runBars } from './vendor/makefun-bars.ts';
+import type { Batch, BarsState, OrderInput } from './vendor/makefun-bars.ts';
 
-const SYM = 'CBBTC';
-const K = 3;            // minutes the impulse is measured over
-const UP = 50;          // bps of rise required to buy
-const TAKE = 200;       // bps of profit that closes the trade
-const STOP = 80;        // bps of loss that closes it
-const SLIP = 100;
+const BPS = 10_000n;
 
-const hist: number[] = [];
-let entry = 0;
+const ENTRY_GAIN_BPS = 50n; // "3 minutes up more than 50 bps"
+const TAKE_PROFIT_BPS = 200n; // sell at +200 bps from entry
+const STOP_LOSS_BPS = 80n; // sell at -80 bps from entry
+const LOOKBACK_BARS = 3; // 3 minutes on 1m bars
+const CASH_NUM = 98n; // notional = 98% of cash (the rest pays the fee)
+const CASH_DEN = 100n;
+const MAX_SLIPPAGE_BPS = 100;
+const MAX_HISTORY = 4096; // closes kept, enough for any window the harness runs
+const PREFERRED_SYMBOL = 'CBBTC';
 
-function onBatch(state: BarsState): unknown {
-  const raw = state.close(SYM);
-  if (raw === null) return [];
-  const c = Number(raw);
-  hist.push(c);
-  if (hist.length > 600) hist.shift();
-
-  const held = state.positions.get(SYM);
-  const qty = held ? Number(held.qty) : 0;
-
-  if (qty > 0 && entry > 0) {
-    const change = (c / entry - 1) * 10000;
-    if (change >= TAKE || change <= -STOP) {
-      entry = 0;
-      return [{ side: 'sell' as const, symbol: SYM, qty: held!.qty.toString(), max_slippage_bps: SLIP }];
-    }
-    return [];
-  }
-
-  if (hist.length <= K) return [];
-  const back = hist[hist.length - 1 - K];
-  const rise = (c / back - 1) * 10000;
-  if (rise > UP && Number(state.cash) > 2_000_000) {
-    entry = c;
-    const spend = Math.floor(Number(state.cash) * 0.98);
-    return [{ side: 'buy' as const, symbol: SYM, notional_quote_units: String(spend), max_slippage_bps: SLIP }];
-  }
-  return [];
+/** The symbol to trade: CBBTC when the universe has it, else the first BTC-ish ticker, else the first. */
+function pickSymbol(state: BarsState): string | null {
+  if (state.symbols.has(PREFERRED_SYMBOL)) return PREFERRED_SYMBOL;
+  for (const ticker of state.symbols.keys()) if (ticker.includes('BTC')) return ticker;
+  for (const ticker of state.symbols.keys()) return ticker;
+  return null;
 }
 
-runBars({ onBatch });
+/** Average cost per unit from a position's cost (fees included), in the symbol's price scale. */
+function costPrice(state: BarsState, symbol: string, qty: bigint, cost: bigint): bigint | null {
+  const meta = state.symbols.get(symbol);
+  if (meta === undefined || qty <= 0n) return null;
+  const quoteScale = BigInt(state.hello.capital.quote_scale);
+  const unitScale = 10n ** BigInt(meta.qty_scale + meta.price_scale);
+  return (cost * unitScale) / (qty * 10n ** quoteScale);
+}
+
+async function main(): Promise<void> {
+  const closes: bigint[] = [];
+  let symbol: string | null = null;
+  let entryPrice: bigint | null = null; // set from the buy fill, cleared by the sell fill
+  let pendingBuy = false; // a buy is on the wire, its fill arrives next batch
+  let pendingSell = false; // a sell is on the wire, its fill arrives next batch
+
+  await runBars({
+    onHello(state: BarsState): void {
+      symbol = pickSymbol(state);
+    },
+
+    onBatch(state: BarsState, batch: Batch): OrderInput[] {
+      if (symbol === null) symbol = pickSymbol(state);
+      const sym = symbol;
+      if (sym === null) return [];
+
+      // 1. Fold in the fills of the decision made on the previous bar.
+      for (const fill of batch.fills) {
+        if (fill.symbol !== sym) continue;
+        if (fill.side === 'buy') {
+          pendingBuy = false;
+          if (fill.status === 'filled') entryPrice = BigInt(fill.price);
+        } else {
+          pendingSell = false;
+          if (fill.status === 'filled') entryPrice = null;
+        }
+      }
+
+      // 2. Keep the close history (one close per bar the symbol traded).
+      const bar = batch.bars.find((b) => b.symbol === sym);
+      if (bar !== undefined) {
+        closes.push(BigInt(bar.c));
+        if (closes.length > MAX_HISTORY) closes.splice(0, closes.length - MAX_HISTORY);
+      }
+
+      const price = state.close(sym);
+      if (price === null || state.warmingUp) return []; // nothing tradeable yet
+
+      // 3. Holding: check take profit / stop loss against the entry price.
+      const position = state.positions.get(sym);
+      if (position !== undefined && position.qty > 0n) {
+        if (entryPrice === null) entryPrice = costPrice(state, sym, position.qty, position.cost);
+        if (pendingSell || entryPrice === null) return [];
+        const entry = entryPrice;
+        const takeProfit = entry + (entry * TAKE_PROFIT_BPS) / BPS;
+        const stopLoss = entry - (entry * STOP_LOSS_BPS) / BPS;
+        if (price >= takeProfit || price <= stopLoss) {
+          pendingSell = true;
+          return [{ side: 'sell', symbol: sym, qty: position.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+        }
+        return [];
+      }
+
+      // 4. Flat: momentum entry, only when the previous decision has settled.
+      if (pendingBuy) return [];
+      if (closes.length <= LOOKBACK_BARS) return [];
+      const now = closes[closes.length - 1]!;
+      const before = closes[closes.length - 1 - LOOKBACK_BARS]!;
+      if (before <= 0n) return [];
+      const gainBps = ((now - before) * BPS) / before;
+      if (gainBps <= ENTRY_GAIN_BPS) return [];
+
+      // 98% of cash, but never past the weight cap the market enforces.
+      const budget = (state.cash * CASH_NUM) / CASH_DEN;
+      const room = state.weightRoom(sym);
+      const notional = budget < room ? budget : room;
+      const minNotional = BigInt(state.hello.fees.min_notional_quote_units);
+      if (notional < minNotional || notional <= 0n) return [];
+
+      pendingBuy = true;
+      return [{ side: 'buy', symbol: sym, notional_quote_units: notional, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+    },
+  });
+}
+
+await main();
